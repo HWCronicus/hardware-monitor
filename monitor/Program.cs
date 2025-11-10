@@ -1,10 +1,9 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
+﻿using System.Net;
+using System.Net.WebSockets;
+using System.Text;
 using System.Text.Json;
-using System.Threading;
 using LibreHardwareMonitor.Hardware;
-using LibreHardwareMonitor.Software;
+
 
 namespace HardwareMonitorApp
 {
@@ -101,7 +100,10 @@ namespace HardwareMonitorApp
 
     class Program
     {
-        static void Main(string[] args)
+        private static readonly List<WebSocket> _connectedClients = new List<WebSocket>();
+        private static readonly object _clientsLock = new object();
+
+        static async Task Main(string[] args)
         {
             // Initialize the Computer object with CPU and GPU monitoring enabled
             var computer = new Computer
@@ -119,6 +121,13 @@ namespace HardwareMonitorApp
             {
                 computer.Open();
 
+                // Start WebSocket server
+                var cancellationTokenSource = new CancellationTokenSource();
+                var serverTask = StartWebSocketServer(cancellationTokenSource.Token);
+
+                Console.WriteLine("WebSocket server started on ws://localhost:42069");
+                Console.WriteLine("Press Ctrl+C to stop...");
+
                 // Run continuously until terminated
                 while (true)
                 {
@@ -126,7 +135,13 @@ namespace HardwareMonitorApp
                     {
                         string jsonOutput = GetHardwareData(computer);
                         Console.Clear();
+                        Console.WriteLine($"WebSocket server running on ws://localhost:42069");
+                        Console.WriteLine($"Connected clients: {_connectedClients.Count}");
+                        Console.WriteLine("Press Ctrl+C to stop...\n");
                         Console.WriteLine(jsonOutput);
+
+                        // Send to all connected WebSocket clients
+                        await BroadcastToClients(jsonOutput);
                     }
                     catch (Exception ex)
                     {
@@ -142,12 +157,120 @@ namespace HardwareMonitorApp
                     }
 
                     // Wait for 100 milliseconds
-                    Thread.Sleep(100);
+                    await Task.Delay(100);
                 }
             }
             finally
             {
                 computer.Close();
+            }
+        }
+
+        private static async Task StartWebSocketServer(CancellationToken cancellationToken)
+        {
+            var listener = new HttpListener();
+            listener.Prefixes.Add("http://localhost:42069/");
+            listener.Start();
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    var context = await listener.GetContextAsync();
+                    if (context.Request.IsWebSocketRequest)
+                    {
+                        _ = Task.Run(async () => await HandleWebSocketConnection(context), cancellationToken);
+                    }
+                    else
+                    {
+                        context.Response.StatusCode = 400;
+                        context.Response.Close();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"WebSocket server error: {ex.Message}");
+                }
+            }
+        }
+
+        private static async Task HandleWebSocketConnection(HttpListenerContext context)
+        {
+            WebSocket webSocket = null;
+            try
+            {
+                var webSocketContext = await context.AcceptWebSocketAsync(null);
+                webSocket = webSocketContext.WebSocket;
+
+                lock (_clientsLock)
+                {
+                    _connectedClients.Add(webSocket);
+                }
+
+                Console.WriteLine($"Client connected. Total clients: {_connectedClients.Count}");
+
+                var buffer = new byte[1024];
+                while (webSocket.State == WebSocketState.Open)
+                {
+                    var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"WebSocket connection error: {ex.Message}");
+            }
+            finally
+            {
+                if (webSocket != null)
+                {
+                    lock (_clientsLock)
+                    {
+                        _connectedClients.Remove(webSocket);
+                    }
+                    Console.WriteLine($"Client disconnected. Total clients: {_connectedClients.Count}");
+                    webSocket?.Dispose();
+                }
+            }
+        }
+
+        private static async Task BroadcastToClients(string jsonOutput)
+        {
+            var buffer = Encoding.UTF8.GetBytes(jsonOutput);
+            var segment = new ArraySegment<byte>(buffer);
+
+            List<WebSocket> clientsToRemove = new List<WebSocket>();
+
+            lock (_clientsLock)
+            {
+                foreach (var client in _connectedClients.ToList())
+                {
+                    if (client.State == WebSocketState.Open)
+                    {
+                        try
+                        {
+                            _ = client.SendAsync(segment, WebSocketMessageType.Text, true, CancellationToken.None);
+                        }
+                        catch
+                        {
+                            clientsToRemove.Add(client);
+                        }
+                    }
+                    else
+                    {
+                        clientsToRemove.Add(client);
+                    }
+                }
+
+                foreach (var client in clientsToRemove)
+                {
+                    _connectedClients.Remove(client);
+                }
             }
         }
 
@@ -419,7 +542,7 @@ namespace HardwareMonitorApp
                 {
                     return "Integrated GPU";
                 }
-                
+
                 // For NVIDIA and AMD, check the name for common integrated GPU identifiers
                 string nameLower = hardware.Name.ToLower();
                 if (nameLower.Contains("integrated") ||
@@ -428,10 +551,10 @@ namespace HardwareMonitorApp
                 {
                     return "Integrated GPU";
                 }
-                
+
                 return "Dedicated GPU";
             }
-            
+
             return hardware.Properties.ToString() ?? "";
         }
 
