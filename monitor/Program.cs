@@ -102,17 +102,19 @@ namespace HardwareMonitorApp
     {
         private static readonly List<WebSocket> _connectedClients = new List<WebSocket>();
         private static readonly object _clientsLock = new object();
+        private static string _latestJsonOutput = string.Empty;
+        private static readonly object _jsonLock = new object();
 
         static async Task Main(string[] args)
         {
-            // Initialize the Computer object with CPU and GPU monitoring enabled
+            // Initialize the Computer object
             var computer = new Computer
             {
                 IsCpuEnabled = true,
                 IsGpuEnabled = true,
                 IsMemoryEnabled = true,
                 IsMotherboardEnabled = true,
-                IsControllerEnabled = true, // Sometimes needed for certain sensors
+                IsControllerEnabled = true,
                 IsNetworkEnabled = false,
                 IsStorageEnabled = false
             };
@@ -123,9 +125,11 @@ namespace HardwareMonitorApp
 
                 // Start WebSocket server
                 var cancellationTokenSource = new CancellationTokenSource();
-                var serverTask = StartWebSocketServer(cancellationTokenSource.Token);
+                var webSocketServerTask = StartWebSocketServer(cancellationTokenSource.Token);
+                var httpServerTask = StartHttpServer(cancellationTokenSource.Token);
 
                 Console.WriteLine("WebSocket server started on ws://localhost:42069");
+                Console.WriteLine("HTTP server started on http://localhost:6969/monitor");
                 Console.WriteLine("Press Ctrl+C to stop...");
 
                 // Run continuously until terminated
@@ -134,11 +138,16 @@ namespace HardwareMonitorApp
                     try
                     {
                         string jsonOutput = GetHardwareData(computer);
-                        Console.Clear();
-                        Console.WriteLine($"WebSocket server running on ws://localhost:42069");
-                        Console.WriteLine($"Connected clients: {_connectedClients.Count}");
-                        Console.WriteLine("Press Ctrl+C to stop...\n");
-                        Console.WriteLine(jsonOutput);
+
+                        // Update the latest JSON output
+                        lock (_jsonLock)
+                        {
+                            _latestJsonOutput = jsonOutput;
+                        }
+
+                        // Clear and write JSON to console
+                        //Console.Clear();
+                        //Console.WriteLine(jsonOutput);
 
                         // Send to all connected WebSocket clients
                         await BroadcastToClients(jsonOutput);
@@ -157,12 +166,69 @@ namespace HardwareMonitorApp
                     }
 
                     // Wait for 100 milliseconds
-                    await Task.Delay(100);
+                    //await Task.Delay(100);
                 }
             }
             finally
             {
                 computer.Close();
+            }
+        }
+
+        private static async Task StartHttpServer(CancellationToken cancellationToken)
+        {
+            var listener = new HttpListener();
+            listener.Prefixes.Add("http://localhost:6969/");
+            listener.Start();
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    var context = await listener.GetContextAsync();
+                    _ = Task.Run(() => HandleGetRequest(context), cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"HTTP server error: {ex.Message}");
+                }
+            }
+        }
+
+        private static void HandleGetRequest(HttpListenerContext context)
+        {
+            try
+            {
+                var request = context.Request;
+                var response = context.Response;
+
+                if (request.HttpMethod == "GET" && request.Url?.AbsolutePath == "/monitor")
+                {
+                    string jsonOutput;
+                    lock (_jsonLock)
+                    {
+                        jsonOutput = _latestJsonOutput;
+                    }
+
+                    byte[] buffer = Encoding.UTF8.GetBytes(jsonOutput);
+                    response.ContentType = "application/json";
+                    response.ContentLength64 = buffer.Length;
+                    response.StatusCode = 200;
+                    response.AddHeader("Access-Control-Allow-Origin", "*");
+                    response.OutputStream.Write(buffer, 0, buffer.Length);
+                    response.OutputStream.Close();
+                }
+                else
+                {
+                    response.StatusCode = 404;
+                    byte[] buffer = Encoding.UTF8.GetBytes("Not Found");
+                    response.OutputStream.Write(buffer, 0, buffer.Length);
+                    response.OutputStream.Close();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"HTTP request handling error: {ex.Message}");
             }
         }
 
@@ -254,7 +320,7 @@ namespace HardwareMonitorApp
                     {
                         try
                         {
-                            _ = client.SendAsync(segment, WebSocketMessageType.Text, true, CancellationToken.None);
+                            client.SendAsync(segment, WebSocketMessageType.Text, true, CancellationToken.None);
                         }
                         catch
                         {
